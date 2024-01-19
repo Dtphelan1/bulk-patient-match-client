@@ -12,7 +12,7 @@ import { BulkDataClient as Types, JsonObject } from "../.."
 import { isRegExp } from "util/types"
 
 
-const debug = util.debuglog("app")
+const debug = util.debuglog("app-request")
 
 
 const HTTP_CACHE = new Map();
@@ -24,7 +24,8 @@ const HTTP_CACHE = new Map();
  * @param noCache Pass true to disable caching
  */
 export async function getWellKnownSmartConfig(baseUrl: string, noCache = false): Promise<Response<JsonObject>> {
-    const url = new URL("/.well-known/smart-configuration", baseUrl);
+    // BUGFIX: Previously a leading slash here would ignore any slugs past the base path   
+    const url = new URL(".well-known/smart-configuration", baseUrl);
     return request<JsonObject>(url, {
         responseType: "json",
         cache: noCache ? false : HTTP_CACHE
@@ -32,7 +33,7 @@ export async function getWellKnownSmartConfig(baseUrl: string, noCache = false):
         x => {
             debug("Fetched .well-known/smart-configuration from %s", url)
             return x
-        },
+        }).catch(
         e => {
             debug(
                 "Failed to fetch .well-known/smart-configuration from %s",
@@ -107,10 +108,8 @@ export async function detectTokenUrl(baseUrl: string): Promise<string> {
             getTokenEndpointFromWellKnownSmartConfig(baseUrl),
             getTokenEndpointFromCapabilityStatement(baseUrl)
         ]);
-        debug("Detected token URL from %s -> %s", baseUrl, tokenUrl)
         return tokenUrl
     } catch {
-        debug("Failed to detect token URL for FHIR server at %s", baseUrl)
         return "none"
     }
 }

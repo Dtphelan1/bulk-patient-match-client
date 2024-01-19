@@ -16,7 +16,7 @@ import FileDownload                     from "./FileDownload"
 import ParseNDJSON                      from "../streams/ParseNDJSON"
 import StringifyNDJSON                  from "../streams/StringifyNDJSON"
 import DocumentReferenceHandler         from "../streams/DocumentReferenceHandler"
-import { BulkDataClient as Types }      from "../.."
+import { JsonObject, BulkDataClient as Types }      from "../.."
 import { FileDownloadError }            from "./errors"
 import {
     assert,
@@ -51,6 +51,12 @@ export interface BulkDataClientEvents {
     "kickOffStart": (this: BulkDataClient, requestOptions: OptionsOfUnknownResponseBody) => void;
     
     /**
+     * Emitted when new export is started
+     * @event
+     */
+    "kickOffPatientMatchStart": (this: BulkDataClient, requestOptions: OptionsOfUnknownResponseBody) => void;
+    
+    /**
      * Emitted when a kick-off response is received
      * @event
      */
@@ -58,6 +64,16 @@ export interface BulkDataClientEvents {
         response            : Response
         capabilityStatement : fhir4.CapabilityStatement
         requestParameters   : Record<string, any>
+        responseHeaders    ?: Types.ResponseHeaders
+    }) => void;
+    
+    /**
+     * Emitted when a kick-off patient match response is received
+     * @event
+     */
+    "kickOffPatientMatchEnd": (this: BulkDataClient, data: {
+        response            : Response
+        capabilityStatement : fhir4.CapabilityStatement
         responseHeaders    ?: Types.ResponseHeaders
     }) => void;
     
@@ -85,6 +101,31 @@ export interface BulkDataClientEvents {
      * @event
      */
     "exportComplete": (this: BulkDataClient, manifest: Types.ExportManifest) => void;
+    
+    /**
+     * Emitted when the export has began
+     * @event
+     */
+    "patientMatchStart": (this: BulkDataClient, status: Types.ExportStatus) => void;
+    
+    /**
+     * Emitted for every status change while waiting for the export
+     * @event
+     */
+    "patientMatchProgress": (this: BulkDataClient, status: Types.ExportStatus) => void;
+
+    "patientMatchError": (this: BulkDataClient, details: {
+        body             : string | fhir4.OperationOutcome | null
+        code             : number | null
+        message         ?: string
+        responseHeaders ?: Types.ResponseHeaders 
+    }) => void;
+    
+    /**
+     * Emitted when the export is completed
+     * @event
+     */
+    "patientMatchComplete": (this: BulkDataClient, manifest: Types.ExportManifest) => void;
     
     /**
      * Emitted when the download starts
@@ -225,8 +266,7 @@ class BulkDataClient extends EventEmitter
      * @param options Any request options
      * @param label Used to render an error message if the request is aborted
      */
-    public async request<T=unknown>(options: OptionsOfUnknownResponseBody, label = "request"): Promise<Response<T>>
-    {
+    public async request<T=unknown>(options: OptionsOfUnknownResponseBody, label = "request"): Promise<Response<T>> {
         const _options: OptionsOfUnknownResponseBody = {
             ...this.options.requests,
             ...options,
@@ -288,14 +328,12 @@ class BulkDataClient extends EventEmitter
      * If the token is expired (or will expire in the next 10 seconds), a new
      * one will be requested and cached.
      */
-    private async getAccessToken()
-    {
+    private async getAccessToken() {
         if (this.accessToken && this.accessTokenExpiresAt - 10 > Date.now() / 1000) {
             return this.accessToken;
         }
 
         const { tokenUrl, clientId, accessTokenLifetime, privateKey } = this.options;
-
         if (!tokenUrl || tokenUrl == "none" || !clientId || !privateKey) {
             return ""
         }
@@ -349,17 +387,9 @@ class BulkDataClient extends EventEmitter
      */
     public async kickOff(): Promise<string>
     {
-        const { fhirUrl, global, group, lenient, patient, post } = this.options;
+        const { fhirUrl, lenient, patient, post } = this.options;
 
-        if (global) {
-            var url = new URL("$export", fhirUrl);
-        }
-        else if (group) {
-            var url = new URL(`Group/${group}/$export`, fhirUrl);
-        }
-        else {
-            var url = new URL("Patient/$export", fhirUrl);
-        }
+        var url = new URL("Patient/$export", fhirUrl);
 
         let capabilityStatement: any;
         try {
@@ -422,6 +452,59 @@ class BulkDataClient extends EventEmitter
                     response: error.response || {}, 
                     capabilityStatement, 
                     requestParameters, 
+                    responseHeaders: this.formatResponseHeaders(error.response.headers),
+                })
+                throw error
+            });
+    }
+    
+    /**
+     * Makes the kick-off request for Patient Match and resolves with the status endpoint URL
+     */
+    public async kickOffPatientMatch(): Promise<string>
+    {
+        const { fhirUrl, lenient } = this.options;
+        
+        const url = new URL("Patient/$bulk-match", fhirUrl);
+
+        let capabilityStatement: any;
+        try {
+            capabilityStatement = (await getCapabilityStatement(fhirUrl)).body
+        } catch {
+            capabilityStatement = {}
+        }
+
+        const requestOptions: OptionsOfUnknownResponseBody = {
+            url,
+            responseType: "json",
+            headers: {
+                accept: "application/fhir+json",
+                prefer: `respond-async${lenient ? ", handling=lenient" : ""}`
+            }
+        }
+
+        requestOptions.method = "POST";
+        requestOptions.json   = this.buildPatientMatchKickOffPayload();
+
+        this.emit("kickOffPatientMatchStart", requestOptions)
+
+        return this.request(requestOptions, "kick-off patient match request")
+            .then(res => {
+                const location = res.headers["content-location"];
+                if (!location) {
+                    throw new Error("The kick-off patient match response did not include content-location header")
+                }
+                this.emit("kickOffPatientMatchEnd", { 
+                    response: res, 
+                    capabilityStatement, 
+                    responseHeaders: this.formatResponseHeaders(res.headers),
+                })
+                return location
+            })
+            .catch(error => {
+                this.emit("kickOffPatientMatchEnd", { 
+                    response: error.response || {}, 
+                    capabilityStatement, 
                     responseHeaders: this.formatResponseHeaders(error.response.headers),
                 })
                 throw error
@@ -556,6 +639,134 @@ class BulkDataClient extends EventEmitter
         return checkStatus()
     }
 
+    /**
+     * Waits for the patient match to be completed and resolves with the export
+     * manifest when done. Emits one "patientMatchStart", multiple "patientMatchProgress"
+     * and one "patientMatchComplete" events.
+     * 
+     * If the server replies with "retry-after" header we will use that to
+     * compute our pooling frequency, but the next pool will be scheduled for
+     * not sooner than 1 second and not later than 10 seconds from now.
+     * Otherwise, the default pooling frequency is 1 second.
+     */
+    public async waitForPatientMatch(statusEndpoint: string): Promise<Types.ExportManifest>
+    {
+        const status = {
+            startedAt       : Date.now(),
+            completedAt     : -1,
+            elapsedTime     : 0,
+            percentComplete : -1,
+            nextCheckAfter  : 1000,
+            message         : "Patient Match started",
+            xProgressHeader : "",
+            retryAfterHeader: "",
+            statusEndpoint
+        };
+
+        this.emit("patientMatchStart", status)
+
+        const checkStatus: () => Promise<Types.ExportManifest> = async () => {
+            
+            return this.request<Types.ExportManifest>({
+                url: statusEndpoint,
+                throwHttpErrors: false,
+                responseType: "json",
+                headers: {
+                    accept: "application/json"
+                }
+            }, "status request").then(res => {
+                const now = Date.now();
+                const elapsedTime = now - status.startedAt
+                
+                status.elapsedTime = elapsedTime
+
+                // Export is complete
+                if (res.statusCode == 200) {
+                    status.completedAt = now
+                    status.percentComplete = 100
+                    status.nextCheckAfter = -1
+                    status.message = `Patient Match completed in ${formatDuration(elapsedTime)}`
+
+                    this.emit("patientMatchProgress", { ...status, virtual: true })
+
+                    try {
+                        expect(res.body, "No export manifest returned").to.exist()
+                        expect(res.body.output, "The export manifest output is not an array").to.be.an.array();
+                        expect(res.body.output, "The export manifest output contains no files").to.not.be.empty()
+                        this.emit("patientMatchComplete", res.body)
+                    } catch (ex) {
+                        this.emit("patientMatchError", {
+                            body: res.body as any || null,
+                            code: res.statusCode || null,
+                            message: (ex as Error).message,
+                            responseHeaders: this.formatResponseHeaders(res.headers),
+                        });
+                        throw ex
+                    }
+
+                    return res.body
+                }
+
+                // Export is in progress
+                if (res.statusCode == 202) {
+                    const now = Date.now();
+
+                    const progress    = String(res.headers["x-progress" ] || "").trim();
+                    const retryAfter  = String(res.headers["retry-after"] || "").trim();
+                    const progressPct = parseInt(progress, 10);
+
+                    let retryAfterMSec = this.options.retryAfterMSec;
+                    if (retryAfter) {
+                        if (retryAfter.match(/\d+/)) {
+                            retryAfterMSec = parseInt(retryAfter, 10) * 1000
+                        } else {
+                            let d = new Date(retryAfter);
+                            retryAfterMSec = Math.ceil(d.getTime() - now)
+                        }
+                    }
+
+                    const poolDelay = Math.min(Math.max(retryAfterMSec, 100), 1000*60)
+
+                    Object.assign(status, {
+                        percentComplete: isNaN(progressPct) ? -1 : progressPct,
+                        nextCheckAfter: poolDelay,
+                        message: isNaN(progressPct) ?
+                            `Patient Match: in progress for ${formatDuration(elapsedTime)}${progress ? ". Server message: " + progress : ""}`:
+                            `Patient Match: ${progressPct}% complete in ${formatDuration(elapsedTime)}`
+                    });
+
+                    this.emit("patientMatchProgress", {
+                        ...status,
+                        retryAfterHeader: retryAfter,
+                        xProgressHeader : progress,
+                        body            : res.body
+                    })
+                    // debug("%o", status)
+                    
+                    return wait(poolDelay, this.abortController.signal).then(checkStatus)
+                }
+                else {
+                    const msg = `Unexpected status response ${res.statusCode} ${res.statusMessage}`
+                    
+                    this.emit("patientMatchError", {
+                        body            : res.body as any || null,
+                        code            : res.statusCode || null,
+                        message         : msg,
+                        responseHeaders : this.formatResponseHeaders(res.headers),
+                    });
+
+                    const error = new Error(msg)
+                    // @ts-ignore
+                    error.body = res.body as any || null
+                    throw error
+                }
+            });
+
+        };
+        
+        return checkStatus()
+    }
+
     public async downloadAllFiles(manifest: Types.ExportManifest): Promise<Types.FileDownload[]>
     {
         
@@ -631,7 +842,6 @@ class BulkDataClient extends EventEmitter
             ];
 
             const tick = () => {
-                
                 let completed = 0
                 let running   = 0
                 for (const job of downloadJobs) {
@@ -1059,6 +1269,73 @@ class BulkDataClient extends EventEmitter
             parameter: parameters
         };
     }
+    
+    private buildPatientMatchKickOffPayload(): fhir4.Parameters
+    {
+        const parameters: fhir4.ParametersParameter[] = []
+
+        // patients --------------------------------------------------------------
+        parameters.push({
+            name: "resource",
+            // TODO - handle more than inlined JSON
+            resource: JSON.parse(this.options.patients)
+        })
+
+        // onlySingleMatch ---------------------------------------------------------------
+        if (this.options.onlySingleMatch) {
+            parameters.push({
+                name: "onlySingleMatch",
+                valueBoolean: Boolean(this.options.onlySingleMatch)
+            });
+        }
+
+        // onlyCertainMatches -----------------------------------------------------------
+        if (this.options.onlyCertainMatches) {
+            parameters.push({
+                name: "onlyCertainMatches",
+                valueBoolean: Boolean(this.options.onlyCertainMatches)
+            });
+        }
+
+        // count -------------------------------------------------------------
+        if (this.options.count) {
+            parameters.push({
+                name: "count",
+                valueInteger: parseInt(String(this.options.count), 10)
+            });
+        }
+
+        // Custom parameters ---------------------------------------------------
+        // if (Array.isArray(this.options.custom)) {
+        //     this.options.custom.forEach(p => {
+        //         let [name, value] = p.trim().split(/\s*=\s*/)
+
+        //         if (value == "false") {
+        //             parameters.push({ name, valueBoolean: false });
+        //         }
+        //         else if (value == "true") {
+        //             parameters.push({ name, valueBoolean: true });
+        //         }
+        //         else if (parseInt(value, 10) + "" === value) {
+        //             parameters.push({ name, valueInteger: parseInt(value, 10) });
+        //         }
+        //         else if (parseFloat(value) + "" === value) {
+        //             parameters.push({ name, valueDecimal: parseFloat(value) });
+        //         }
+        //         else if (fhirInstant(value)) {
+        //             parameters.push({ name, valueInstant: fhirInstant(value) })
+        //         }
+        //         else {
+        //             parameters.push({ name, valueString: value })
+        //         }
+        //     })
+        // }
+
+        return {
+            resourceType: "Parameters",
+            parameter: parameters
+        };
+    }
 
     public cancelExport(statusEndpoint: string) {
         this.abort();
@@ -1068,6 +1345,19 @@ class BulkDataClient extends EventEmitter
             responseType: "json"
         });
     }
+
+//     private createDestinationReadStream(filename: string, subFolder = ""): Readable { 
+
+//     }
+
+//     public loadPatientMatches(downloads: FileDownload[]) : JsonObject[] { 
+//         // Join each filename with the destination 
+
+//         // get a read stream for each file
+
+//         // Load into memory
+//         return 
+//     }
 }
 
 export default BulkDataClient

@@ -57,12 +57,17 @@ export declare namespace BulkDataClient {
         accessTokenLifetime?: number
 
         
-        // Kick-off parameters -------------------------------------------------
+        // Patient Match Kick-off parameters -------------------------------------------------
+        patients?: string
+        onlySingleMatch?: boolean
+        onlyCertainMatches?: boolean
+        count?: number
+
+        // Export Kick-off parameters -------------------------------------------------
         _outputFormat?: string
         _since?: string
         _type?: string
         _elements?: string
-        patient?: string
         includeAssociatedData?: string
         _typeFilter?: string
 
@@ -268,11 +273,22 @@ export declare namespace BulkDataClient {
          */
         fhirUrl?: string
 
+        /**
+         * Patient Match Kick-off parameters
+         * TODO: Support inline patients list based on file path?
+         */
+        patients?: string,
+        onlySingleMatch?: boolean
+        onlyCertainMatches?: boolean
+        count?: number
+        
+        /**
+         * Bulk Export Kick-off parameters
+         */
         _outputFormat?: string
         _since?: string
         _type?: string
         _elements?: string
-        patient?: string
         includeAssociatedData?: string
         _typeFilter?: string
 
@@ -318,17 +334,25 @@ export declare namespace BulkDataClient {
 
         reporter: "cli" | "text"
 
+        /**
+         * Patient Matching kick off parameters 
+         */
+        patients: string
+        onlySingleMatch?: boolean
+        onlyCertainMatches?: boolean
+        count?: number
+        
+        /**
+         * Bulk Export kick off parameters 
+         */
+        patient?: string
         _outputFormat?: string
         _since?: string
         _type?: string
         _elements?: string
-        patient?: string
         includeAssociatedData?: string
         _typeFilter?: string
         custom?: string[]
-
-        global: boolean
-        group: string
         post: boolean
 
         /**

@@ -6,6 +6,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 require("colors");
 const commander_1 = require("commander");
 const path_1 = require("path");
+const util_1 = __importDefault(require("util"));
 const node_jose_1 = __importDefault(require("node-jose"));
 const prompt_sync_1 = __importDefault(require("prompt-sync"));
 const utils_1 = require("./lib/utils");
@@ -13,10 +14,12 @@ const BulkDataClient_1 = __importDefault(require("./lib/BulkDataClient"));
 const cli_1 = __importDefault(require("./reporters/cli"));
 const text_1 = __importDefault(require("./reporters/text"));
 const loggers_1 = require("./loggers");
+const fs_1 = require("fs");
 const reporters = {
     cli: cli_1.default,
     text: text_1.default
 };
+const debug = util_1.default.debuglog("app-request");
 const APP = new commander_1.Command();
 APP.name("node .");
 APP.version("2.0.0");
@@ -180,6 +183,34 @@ APP.action(async (args) => {
         console.error(error);
         process.exit(1);
     });
+    const patientMatchStatusEndpoint = options.status || await client.kickOffPatientMatch();
+    const patientMatchManifest = await client.waitForPatientMatch(patientMatchStatusEndpoint);
+    const patientMatches = await client.downloadAllFiles(patientMatchManifest);
+    // TODO: fix hacky solution of loading files into memory
+    // debug(patientMatchDownloads)
+    const matches = patientMatches.reduce((accum, file) => {
+        // Load each match into memory; only works when destination is local to disk
+        const data = JSON.parse((0, fs_1.readFileSync)((0, path_1.join)(options.destination, file.name), 'utf-8'));
+        // For each match bundle, iterate over all entries and get the ids of the patient resources
+        if (data.total === 0)
+            return accum;
+        const newAccum = [...accum];
+        // Entry is guaranteed because we have a non-zero total
+        data.entry.forEach((match) => {
+            if (!match || !match.resource || !match.resource.id) {
+                return;
+            }
+            else {
+                newAccum.push(match.resource.id);
+            }
+        });
+        return newAccum;
+    }, []);
+    debug(JSON.stringify(matches));
+    // CONVERT PATIENT LIST TO A LIST OF PATIENT REQUESTS
+    options.patient = matches.join(', ');
+    // BACK TO BULK FHIR
+    // TODO: Create a new status param for bulk vs patient match
     const statusEndpoint = options.status || await client.kickOff();
     const manifest = await client.waitForExport(statusEndpoint);
     const downloads = await client.downloadAllFiles(manifest);
@@ -187,7 +218,8 @@ APP.action(async (args) => {
     if (options.reporter === "cli") {
         const answer = (0, prompt_sync_1.default)()("Do you want to signal the server that this export can be removed? [Y/n]".cyan);
         if (!answer || answer.toLowerCase() === 'y') {
-            client.cancelExport(statusEndpoint).then(() => console.log("\nThe server was asked to remove this export!".green.bold));
+            client.cancelExport(patientMatchStatusEndpoint).then(() => console.log("\nThe server was asked to remove this patient match !".green.bold));
+            client.cancelExport(statusEndpoint).then(() => console.log("\nThe server was asked to remove this bulk export!".green.bold));
         }
     }
 });

@@ -1,6 +1,7 @@
 import                               "colors"
 import { Command }              from "commander"
-import { resolve }              from "path"
+import { join, resolve }              from "path"
+import util                     from "util"
 import jose                     from "node-jose"
 import prompt                   from "prompt-sync"
 import { BulkDataClient }       from ".."
@@ -9,11 +10,15 @@ import Client                   from "./lib/BulkDataClient"
 import CLIReporter              from "./reporters/cli"
 import TextReporter             from "./reporters/text"
 import { createLogger }         from "./loggers"
+import { readFileSync } from "fs"
+import { Bundle } from "fhir/r4"
 
 const reporters = {
     cli : CLIReporter,
     text: TextReporter
 }
+
+const debug = util.debuglog("app-request")
 
 const APP = new Command()
 
@@ -51,7 +56,6 @@ APP.action(async (args: BulkDataClient.CLIOptions) => {
         const cfg: BulkDataClient.ConfigFileOptions = require(configPath)
         Object.assign(options, cfg)
     }
-
     Object.assign(options, params)
 
 
@@ -212,6 +216,34 @@ APP.action(async (args: BulkDataClient.CLIOptions) => {
         process.exit(1);
     })
     
+    const patientMatchStatusEndpoint = options.status || await client.kickOffPatientMatch()
+    const patientMatchManifest = await client.waitForPatientMatch(patientMatchStatusEndpoint)
+    const patientMatches = await client.downloadAllFiles(patientMatchManifest)
+    // TODO: fix hacky solution of loading files into memory
+    // debug(patientMatchDownloads)
+    const matches = patientMatches.reduce((accum: string[], file: BulkDataClient.FileDownload) => { 
+        // Load each match into memory; only works when destination is local to disk
+        const data = JSON.parse(readFileSync(join(options.destination, file.name), 'utf-8')) as Bundle
+        // For each match bundle, iterate over all entries and get the ids of the patient resources
+        if (data.total === 0) return accum
+        const newAccum = [...accum]
+        // Entry is guaranteed because we have a non-zero total
+        data.entry!.forEach((match) => { 
+            if (!match || !match.resource || !match.resource.id) { 
+                return;
+            } else {
+                newAccum.push(match.resource.id)
+            }
+        })
+        return newAccum
+    },[])
+    debug(JSON.stringify(matches))
+    
+    // CONVERT PATIENT LIST TO A LIST OF PATIENT REQUESTS
+    options.patient = matches.join(', ')
+
+    // BACK TO BULK FHIR
+    // TODO: Create a new status param for bulk vs patient match
     const statusEndpoint = options.status || await client.kickOff()
     const manifest = await client.waitForExport(statusEndpoint)
     const downloads = await client.downloadAllFiles(manifest)
@@ -220,8 +252,11 @@ APP.action(async (args: BulkDataClient.CLIOptions) => {
     if (options.reporter === "cli") {
         const answer = prompt()("Do you want to signal the server that this export can be removed? [Y/n]".cyan);
         if (!answer || answer.toLowerCase() === 'y') {
+            client.cancelExport(patientMatchStatusEndpoint).then(
+                () => console.log("\nThe server was asked to remove this patient match !".green.bold)
+            )
             client.cancelExport(statusEndpoint).then(
-                () => console.log("\nThe server was asked to remove this export!".green.bold)
+                () => console.log("\nThe server was asked to remove this bulk export!".green.bold)
             )
         }
     }

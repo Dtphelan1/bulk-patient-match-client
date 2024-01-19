@@ -15,7 +15,7 @@ const zlib_1 = __importDefault(require("zlib"));
 const request_1 = __importDefault(require("./request"));
 const stream_1 = require("stream");
 const types_1 = require("util/types");
-const debug = util_1.default.debuglog("app");
+const debug = util_1.default.debuglog("app-request");
 const HTTP_CACHE = new Map();
 /**
  * Given a `baseUrl` fetches a `/.well-known/smart-configuration` statement
@@ -24,14 +24,15 @@ const HTTP_CACHE = new Map();
  * @param noCache Pass true to disable caching
  */
 async function getWellKnownSmartConfig(baseUrl, noCache = false) {
-    const url = new url_1.URL("/.well-known/smart-configuration", baseUrl);
+    // BUGFIX: Previously a leading slash here would ignore any slugs past the base path   
+    const url = new url_1.URL(".well-known/smart-configuration", baseUrl);
     return (0, request_1.default)(url, {
         responseType: "json",
         cache: noCache ? false : HTTP_CACHE
     }).then(x => {
         debug("Fetched .well-known/smart-configuration from %s", url);
         return x;
-    }, e => {
+    }).catch(e => {
         debug("Failed to fetch .well-known/smart-configuration from %s", url, e.response?.statusCode, e.response?.statusMessage);
         throw e;
     });
@@ -92,11 +93,9 @@ async function detectTokenUrl(baseUrl) {
             getTokenEndpointFromWellKnownSmartConfig(baseUrl),
             getTokenEndpointFromCapabilityStatement(baseUrl)
         ]);
-        debug("Detected token URL from %s -> %s", baseUrl, tokenUrl);
         return tokenUrl;
     }
     catch {
-        debug("Failed to detect token URL for FHIR server at %s", baseUrl);
         return "none";
     }
 }
